@@ -1,7 +1,179 @@
+provider "aws" {
+  region = var.REGION
+}
+
+resource "aws_ecs_cluster" "my_cluster" {
+  name = var.CLUSTER_NAME
+}
 
 
-resource "aws_instance" "react-frontend" {
-    ami = var.AMIS[var.REGION]
-    instance_type = "t2.micro"
-    vpc_security_group_ids = ["sg-0e59babbc7f6aeed0"]
-} 
+resource "aws_lb" "lms_lb" {
+  name               = var.LOAD_BALANCER_NAME
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = ["sg-016e2591b7f949d99"]
+  subnets            = ["subnet-0ffd405711375c017", "subnet-0e63b67043cd1f4aa"]
+}
+
+resource "aws_lb_listener" "my_listener" {
+  load_balancer_arn = aws_lb.lms_lb.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type = "fixed-response"
+    fixed_response {
+      content_type = "text/plain"
+      status_code  = 200
+      message_body = "OK"
+    }
+  }
+}
+
+resource "aws_lb_target_group" "my_target_group" {
+  name        = var.TARGET_GROUP_NAME
+  port        = 2000
+  protocol    = "HTTP"
+  vpc_id      = "vpc-0816ba4118fcc07c3"
+  target_type = "ip"
+  health_check {
+    path                = "/"
+    interval            = 30
+    timeout             = 10
+    healthy_threshold   = 3
+    unhealthy_threshold = 3
+  }
+}
+
+resource "aws_iam_role" "ecs_execution_role" {
+  name = "ecs_execution_role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        }
+      },
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_execution_role_policy" {
+  role       = aws_iam_role.ecs_execution_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+resource "aws_ecs_task_definition" "my_task_definition" {
+  family                   = var.TASKNAME
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = "256"
+  memory                   = "512"
+  execution_role_arn       = aws_iam_role.ecs_execution_role.arn
+  task_role_arn            = aws_iam_role.ecs_execution_role.arn
+  container_definitions = jsonencode([{
+    name  = "lms-test",
+    image = "905418133399.dkr.ecr.ap-south-1.amazonaws.com/lms-test:latest",
+    portMappings = [{
+      containerPort = 2000,
+      hostPort      = 2000
+    }]
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": {
+        "awslogs-group": "ecs_logs",
+        "awslogs-region": "ap-south-1",
+        "awslogs-stream-prefix": "streaming"
+      }
+    }
+
+  }])
+}
+
+
+resource "aws_lb_listener_rule" "my_listener_rule" {
+  listener_arn = aws_lb_listener.my_listener.arn
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.my_target_group.arn
+  }
+  condition {
+    path_pattern {
+      values = ["/*"]
+    }
+  }
+}
+
+resource "aws_ecs_service" "my_service" {
+  name            = var.ECS_SERVICE_NAME
+  cluster         = aws_ecs_cluster.my_cluster.id
+  task_definition = aws_ecs_task_definition.my_task_definition.arn
+
+  network_configuration {
+    security_groups  = ["sg-016e2591b7f949d99"]
+    subnets          = ["subnet-0ffd405711375c017", "subnet-0e63b67043cd1f4aa"]
+    assign_public_ip = true
+  }
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.my_target_group.arn
+    container_name   = "lms-test"
+    container_port   = 2000
+  }
+  depends_on = [
+    aws_lb_listener_rule.my_listener_rule,
+  ]
+
+  desired_count = 1
+
+  enable_ecs_managed_tags = true
+
+  deployment_controller {
+    type = "ECS"
+  }
+
+  launch_type = "FARGATE"
+}
+
+
+resource "aws_appautoscaling_target" "ecs_service" {
+  max_capacity       = 10
+  min_capacity       = 1
+  resource_id        = "service/${aws_ecs_cluster.my_cluster.name}/${aws_ecs_service.my_service.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
+
+  depends_on = [
+    aws_ecs_service.my_service,
+  ]
+}
+
+resource "aws_appautoscaling_policy" "ecs_scaling_policy_cpu" {
+  name        = "ecs-scaling-policy-cpu"
+  policy_type = "TargetTrackingScaling"
+
+  resource_id        = "service/${aws_ecs_cluster.my_cluster.name}/${aws_ecs_service.my_service.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
+
+  target_tracking_scaling_policy_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+    }
+
+    scale_in_cooldown  = 300
+    scale_out_cooldown = 300
+
+    target_value = 60.0
+  }
+
+  depends_on = [
+    aws_appautoscaling_target.ecs_service,
+  ]
+}
+
+
