@@ -67,6 +67,76 @@ resource "aws_iam_role_policy_attachment" "ecs_execution_role_policy" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
+
+
+
+resource "aws_elasticache_subnet_group" "my_redis_subnet" {
+  name       = "lms-redis"
+  subnet_ids = ["subnet-0ffd405711375c017", "subnet-0e63b67043cd1f4aa"]
+}
+
+
+resource "aws_db_subnet_group" "my_db_subnet_group" {
+  name       = "my-db-subnet-group"
+  subnet_ids = ["subnet-0ffd405711375c017", "subnet-0e63b67043cd1f4aa"]
+
+}
+
+resource "aws_elasticache_cluster" "my_redis" {
+  cluster_id           = "redis-cluster"
+  engine               = "redis"
+  node_type            = "cache.t3.micro"
+  num_cache_nodes      = 1
+  parameter_group_name = "default.redis7"
+  subnet_group_name    = aws_elasticache_subnet_group.my_redis_subnet.name
+  security_group_ids   = ["sg-016e2591b7f949d99"]
+}
+
+resource "aws_db_parameter_group" "postgresql" {
+  name        = "custom-postgresql"
+  family      = "postgres16"
+
+  parameter {
+    name  = "rds.force_ssl"
+    value = "0"
+  }
+}
+
+resource "aws_db_instance" "my_db" {
+  allocated_storage = 10
+  storage_type      = "gp2"
+  engine            = "postgres"
+  instance_class    = "db.t3.micro"
+  db_name = "postgres"
+  identifier        = "postgres-db"
+  username          = "Adil12341"
+  password          = "Adil1234"
+
+  vpc_security_group_ids = ["sg-016e2591b7f949d99"]
+  db_subnet_group_name   = aws_db_subnet_group.my_db_subnet_group.name
+  skip_final_snapshot    = true
+  publicly_accessible  = true
+  storage_encrypted = true
+  parameter_group_name = aws_db_parameter_group.postgresql.name
+
+  lifecycle {
+    ignore_changes = [password]
+  }
+
+  provisioner "local-exec" {
+    command = "sh ./backup.sh"
+
+    environment = {
+      PATH = "/usr/local/bin/bash"
+    }
+  }
+
+}
+
+output "db_instance_endpoint" {
+  value = aws_db_instance.my_db.endpoint
+}
+
 resource "aws_ecs_task_definition" "my_task_definition" {
   family                   = var.TASKNAME
   network_mode             = "awsvpc"
@@ -82,12 +152,38 @@ resource "aws_ecs_task_definition" "my_task_definition" {
       containerPort = 2000,
       hostPort      = 2000
     }]
-    "logConfiguration": {
-      "logDriver": "awslogs",
-      "options": {
-        "awslogs-group": "ecs_logs",
-        "awslogs-region": "ap-south-1",
-        "awslogs-stream-prefix": "streaming"
+    environment = [
+      {
+        name  = "REDIS_URL",
+        value = "redis://${aws_elasticache_cluster.my_redis.cache_nodes[0].address}:6379"
+      },
+      {
+        name  = "DB_HOST",
+        value = "${aws_db_instance.my_db.address}"
+      },
+      {
+        name  = "DB_PORT",
+        value = "5432"
+      },
+      {
+        name  = "DB_NAME",
+        value = aws_db_instance.my_db.db_name
+      },
+      {
+        name  = "DB_USER",
+        value = aws_db_instance.my_db.username
+      },
+      {
+        name  = "DB_PASSWORD",
+        value = aws_db_instance.my_db.password
+      }
+    ]
+    "logConfiguration" : {
+      "logDriver" : "awslogs",
+      "options" : {
+        "awslogs-group" : "ecs_logs",
+        "awslogs-region" : "ap-south-1",
+        "awslogs-stream-prefix" : "streaming"
       }
     }
 
