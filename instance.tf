@@ -62,11 +62,32 @@ resource "aws_iam_role" "ecs_execution_role" {
   })
 }
 
+resource "aws_iam_policy" "ecs_update_service_policy" {
+  name        = "ecs_update_service_policy"
+  path        = "/"
+  description = "Policy to allow ecs:UpdateService on specific service"
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Action = "ecs:UpdateService",
+        Resource = "arn:aws:ecs:ap-south-1:905418133399:service/lms/import-sql"
+      }
+    ]
+  })
+}
+
 resource "aws_iam_role_policy_attachment" "ecs_execution_role_policy" {
   role       = aws_iam_role.ecs_execution_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
+resource "aws_iam_role_policy_attachment" "ecs_update_service_policy_attachment" {
+  role       = aws_iam_role.ecs_execution_role.name
+  policy_arn = aws_iam_policy.ecs_update_service_policy.arn
+}
 
 
 
@@ -93,8 +114,8 @@ resource "aws_elasticache_cluster" "my_redis" {
 }
 
 resource "aws_db_parameter_group" "postgresql" {
-  name        = "custom-postgresql"
-  family      = "postgres16"
+  name   = "custom-postgresql"
+  family = "postgres16"
 
   parameter {
     name  = "rds.force_ssl"
@@ -107,7 +128,7 @@ resource "aws_db_instance" "my_db" {
   storage_type      = "gp2"
   engine            = "postgres"
   instance_class    = "db.t3.micro"
-  db_name = "postgres"
+  db_name           = "postgres"
   identifier        = "postgres-db"
   username          = "Adil12341"
   password          = "Adil1234"
@@ -115,21 +136,14 @@ resource "aws_db_instance" "my_db" {
   vpc_security_group_ids = ["sg-016e2591b7f949d99"]
   db_subnet_group_name   = aws_db_subnet_group.my_db_subnet_group.name
   skip_final_snapshot    = true
-  publicly_accessible  = true
-  storage_encrypted = true
-  parameter_group_name = aws_db_parameter_group.postgresql.name
+  publicly_accessible    = true
+  storage_encrypted      = true
+  parameter_group_name   = aws_db_parameter_group.postgresql.name
 
   lifecycle {
     ignore_changes = [password]
   }
 
-  provisioner "local-exec" {
-    command = "sh ./backup.sh"
-
-    environment = {
-      PATH = "/usr/local/bin/bash"
-    }
-  }
 
 }
 
@@ -145,38 +159,69 @@ resource "aws_ecs_task_definition" "my_task_definition" {
   memory                   = "512"
   execution_role_arn       = aws_iam_role.ecs_execution_role.arn
   task_role_arn            = aws_iam_role.ecs_execution_role.arn
-  container_definitions = jsonencode([{
-    name  = "lms-test",
-    image = "905418133399.dkr.ecr.ap-south-1.amazonaws.com/lms-test:latest",
-    portMappings = [{
-      containerPort = 2000,
-      hostPort      = 2000
-    }]
-    environment = [
-      {
-        name  = "REDIS_URL",
-        value = "redis://${aws_elasticache_cluster.my_redis.cache_nodes[0].address}:6379"
-      },
-      {
-        name  = "DB_HOST",
-        value = "${aws_db_instance.my_db.address}"
-      },
-      {
-        name  = "DB_PORT",
-        value = "5432"
-      },
-      {
-        name  = "DB_NAME",
-        value = aws_db_instance.my_db.db_name
-      },
-      {
-        name  = "DB_USER",
-        value = aws_db_instance.my_db.username
-      },
-      {
-        name  = "DB_PASSWORD",
-        value = aws_db_instance.my_db.password
+  container_definitions = jsonencode([
+    {
+      name  = "lms-test",
+      image = "905418133399.dkr.ecr.ap-south-1.amazonaws.com/lms-test:latest",
+      portMappings = [{
+        containerPort = 2000,
+        hostPort      = 2000
+      }]
+      environment = [
+        {
+          name  = "REDIS_URL",
+          value = "redis://${aws_elasticache_cluster.my_redis.cache_nodes[0].address}:6379"
+        },
+        {
+          name  = "DB_HOST",
+          value = "${aws_db_instance.my_db.address}"
+        },
+        {
+          name  = "DB_PORT",
+          value = "5432"
+        },
+        {
+          name  = "DB_NAME",
+          value = aws_db_instance.my_db.db_name
+        },
+        {
+          name  = "DB_USER",
+          value = aws_db_instance.my_db.username
+        },
+        {
+          name  = "DB_PASSWORD",
+          value = aws_db_instance.my_db.password
+        }
+      ]
+      "logConfiguration" : {
+        "logDriver" : "awslogs",
+        "options" : {
+          "awslogs-group" : "ecs_logs",
+          "awslogs-region" : "ap-south-1",
+          "awslogs-stream-prefix" : "streaming"
+        }
       }
+    }
+  ])
+  depends_on = [aws_ecs_service.import_sql_service]
+}
+
+resource "aws_ecs_task_definition" "sql_import" {
+  family                   = "sqlimporttask"
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  memory                   = "512"
+  cpu                      = "256"
+  execution_role_arn       = aws_iam_role.ecs_execution_role.arn
+  task_role_arn            = aws_iam_role.ecs_execution_role.arn
+
+  container_definitions = jsonencode([{
+    name       = "import-sql",
+    image      = "postgres:16-alpine"
+    essential  = true
+    entryPoint = ["sh", "-c"]
+    command = [
+      "apk add --no-cache aws-cli 1> /dev/null && echo 'packages installed' && echo 'Downloading SQL file from S3...' && aws s3 cp s3://backupsqldump/tetr.sql /tmp/initial_data.sql && ls -l /tmp/initial_data.sql && echo 'Importing SQL file into PostgreSQL...' && PGPASSWORD=Adil1234 psql -h ${aws_db_instance.my_db.address} -p 5432 -U Adil12341 -d postgres -f /tmp/initial_data.sql && echo 'Backup and import finished'"
     ]
     "logConfiguration" : {
       "logDriver" : "awslogs",
@@ -186,7 +231,6 @@ resource "aws_ecs_task_definition" "my_task_definition" {
         "awslogs-stream-prefix" : "streaming"
       }
     }
-
   }])
 }
 
@@ -222,6 +266,7 @@ resource "aws_ecs_service" "my_service" {
   }
   depends_on = [
     aws_lb_listener_rule.my_listener_rule,
+    aws_db_instance.my_db,
   ]
 
   desired_count = 1
@@ -233,6 +278,20 @@ resource "aws_ecs_service" "my_service" {
   }
 
   launch_type = "FARGATE"
+}
+
+resource "aws_ecs_service" "import_sql_service" {
+  name            = "import-sql"
+  cluster         = aws_ecs_cluster.my_cluster.id
+  task_definition = aws_ecs_task_definition.sql_import.arn
+  desired_count   = 1
+  launch_type     = "FARGATE"
+  network_configuration {
+    security_groups  = ["sg-016e2591b7f949d99"]
+    subnets          = ["subnet-0ffd405711375c017", "subnet-0e63b67043cd1f4aa"]
+    assign_public_ip = true
+  }
+  depends_on = [aws_ecs_task_definition.sql_import]
 }
 
 
