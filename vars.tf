@@ -25,7 +25,9 @@ variable "LOAD_BALANCER_NAME" {
 }
 
 
-
+variable "db_name" {
+  default = "custom-postgressql"
+}
 
 
 
